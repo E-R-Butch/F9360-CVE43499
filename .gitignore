@@ -1,0 +1,5 @@
+# binaries built from source recipes in README — kept in tree on purpose
+# (small enough for git; release assets mirror them)
+
+# macOS junk
+.DS_Store
