@@ -230,10 +230,13 @@ adb -s RFCW31TJJ0T push build/q4q-F9360ZCSAIZF1/cve-2026-43499-root /data/local/
 
 ```bash
 # 重启后必须等 loadavg < 2.5（watch /proc/loadavg）再跑，高负载必失败
+# ⚠️ 清残留禁用 pkill -f：-f 模式会匹配执行者自身 shell 的 cmdline → SIGKILL 自杀 (2026-09-01 实测)。
+#    残留用 ps 核对后按 PID 点名杀；无残留直接跳过清理。
+# ⚠️ EXPLOIT_ATTEMPTS=1：attempt 1 失败时设备状态已被污染，自动补射第 2 发只会滚进不稳定状态（历史: retry→attempt2→后续 panic）。
+#    一次成败，失败即停、取证、重启重来。
 adb -s RFCW31TJJ0T shell "
-  pkill -9 -f 'cve-2026-43499';   # 清残留（⚠️ 勿在 root daemon 活着时用，会误杀通道）
   cd /data/local/tmp
-  KSU_LOAD_ONLY=1 EXP32_STAMP_OFF=0x58 EXPLOIT_ATTEMPTS=3 \
+  KSU_LOAD_ONLY=1 EXP32_STAMP_OFF=0x58 EXPLOIT_ATTEMPTS=1 \
   LD_PRELOAD=/data/local/tmp/cve-2026-43499 nohup sh -c 'sleep 3600' > exp.log 2>&1
 "
 adb -s RFCW31TJJ0T shell "/data/local/tmp/cve-2026-43499-root -c 'id'"
@@ -277,6 +280,9 @@ adb -s RFCW31TJJ0T shell "su -c id"
 # 2. 跑 §8.2 exploit（一次成功率高）→ 验证 root
 # 3. 跑 §8.3 加载 → 验证 /proc/modules
 # 4. su 可用 + Manager 识别
+# 5. ⚠️ force-stop + 重开 Manager：模块加载前已开着的管理器进程缓存了"未安装"状态
+#    （内核后来才加冕它，旧进程拿不到 ksu fd），不重开会一直错显"未安装"：
+adb -s RFCW31TJJ0T shell "am force-stop me.weishu.kernelsu; am start -n me.weishu.kernelsu/.ui.MainActivity"
 # 全流程 ~3 分钟。scripts/restore-root.sh 为半自动模板。
 ```
 
@@ -309,7 +315,7 @@ adb -s RFCW31TJJ0T shell "su -c id"
 
 1. **exploit 负载门控**：开机后 loadavg ≥ 2.5 必失败（LMKD SIGKILL，日志停在 `find_collisions` 同字节数）。等负载降再跑。
 2. **panic 后文件清零**：F2FS 页缓存损坏，`/data/local/tmp` 文件可能被清零——panic 后 MD5 核对所有二进制。
-3. **`pkill -9 -f cve-2026-43499` 会误杀 root daemon**：root 通道也没了，须重启重来。
+3. **禁用 `pkill -9 -f` 清残留**（双重坑，2026-09-01 均实测）：`-f` 模式会匹配执行者自身 shell 的 cmdline → 直接 SIGKILL 自己（exit 137）；且若 root daemon 还活着也会一并误杀。残留只准 `ps` 核对后按 PID 点名杀，无残留则跳过。
 4. **tracefs slide 泄漏跨 boot 不稳定**：成功 boot 的 slide 稳定；失败 boot（CFI mismatch）直接重启重试，不要 chase 代码。
 5. **stdout 块缓冲丢日志**：重定向到文件时 printf 是块缓冲，panic 时丢最后一段日志。`set_unbuffer()`（kernelsu 工具链自带）在 `run_exploit` 里调用，此前从未被调用。
 6. **kptr_restrict=2 连内核域 root 都隐藏地址**：先 `echo 0 > /proc/sys/kernel/kptr_restrict`，加载器必须跳过 addr==0 行。

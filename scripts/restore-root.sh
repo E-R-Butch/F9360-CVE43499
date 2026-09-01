@@ -27,8 +27,8 @@ for i in $(seq 1 60); do
 done
 say "loadavg=$L ✓"
 
-say "3/5 运行 exploit（临时 root）"
-$ADB shell "cd $TMP && KSU_LOAD_ONLY=1 EXP32_STAMP_OFF=0x58 EXPLOIT_ATTEMPTS=3 \
+say "3/5 运行 exploit（临时 root, 单发=1: 失败即停, 勿自动补射）"
+$ADB shell "cd $TMP && KSU_LOAD_ONLY=1 EXP32_STAMP_OFF=0x58 EXPLOIT_ATTEMPTS=1 \
   LD_PRELOAD=$TMP/cve-2026-43499 nohup sh -c 'sleep 3600' > $TMP/exp.log 2>&1"
 # exploit 是异步的：轮询 root 通道（最多 ~4 分钟）
 ROOT_OK=0
@@ -56,4 +56,7 @@ echo "$LOG" | grep -q "KernelSU loaded OK" || fail "模块未加载（ksu-load.l
 $ADB shell "cat /proc/modules" | grep -q kernelsu || fail "/proc/modules 无 kernelsu"
 $ADB shell "su -c id" | tr -d '\r' | grep -q "u:r:ksu:s0" || fail "su 未生效"
 say "✓ KernelSU Live + su 可用 + Manager 应显示内核版本"
-say "完成（如需 Manager 授权请打开 App）"
+
+say "6/6 重启 Manager（模块加载前已开着的旧进程缓存了未安装状态）"
+$ADB shell "am force-stop me.weishu.kernelsu; am start -n me.weishu.kernelsu/.ui.MainActivity"
+say "✓ 完成（如需 Manager 授权请打开 App）"
